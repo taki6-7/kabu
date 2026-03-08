@@ -168,9 +168,29 @@ def main():
     run(top_n=args.top_n, dry_run=args.dry_run)
 
 
+def _wait_for_keypress():
+    """ウィンドウが閉じないよう、キー入力を待つ（ダブルクリック実行時対策）"""
+    # タスクスケジューラ等の非対話環境では待たない
+    if not sys.stdin.isatty():
+        return
+    print("\n何かキーを押すと終了します...", flush=True)
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            msvcrt.getch()
+        except Exception:
+            input()
+    else:
+        input()
+
+
 if __name__ == "__main__":
+    _exit_code = 0
     try:
         main()
     except Exception as e:
         logger.exception(f"致命的エラーが発生しました: {e}")
-        sys.exit(1)
+        _exit_code = 1
+    finally:
+        _wait_for_keypress()
+        sys.exit(_exit_code)
