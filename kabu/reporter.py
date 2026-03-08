@@ -1,0 +1,359 @@
+"""
+HTMLレポート生成モジュール
+"""
+
+import os
+from datetime import datetime
+from pathlib import Path
+
+TEMPLATE = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>株式推奨レポート {date}</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: 'Helvetica Neue', Arial, 'Hiragino Kaku Gothic ProN', 'メイリオ', sans-serif;
+      background: #0f1117;
+      color: #e8e8e8;
+      padding: 24px;
+    }}
+    .header {{
+      text-align: center;
+      margin-bottom: 32px;
+      padding: 24px;
+      background: linear-gradient(135deg, #1a1f2e 0%, #16213e 100%);
+      border-radius: 12px;
+      border: 1px solid #2a3550;
+    }}
+    .header h1 {{
+      font-size: 1.8rem;
+      color: #4fc3f7;
+      margin-bottom: 8px;
+    }}
+    .header .subtitle {{
+      color: #90a4ae;
+      font-size: 0.9rem;
+    }}
+    .summary-bar {{
+      display: flex;
+      gap: 16px;
+      margin-bottom: 28px;
+      flex-wrap: wrap;
+    }}
+    .summary-card {{
+      flex: 1;
+      min-width: 140px;
+      background: #1a1f2e;
+      border: 1px solid #2a3550;
+      border-radius: 8px;
+      padding: 16px;
+      text-align: center;
+    }}
+    .summary-card .label {{ color: #90a4ae; font-size: 0.75rem; margin-bottom: 4px; }}
+    .summary-card .value {{ color: #4fc3f7; font-size: 1.5rem; font-weight: bold; }}
+    .stock-card {{
+      background: #1a1f2e;
+      border: 1px solid #2a3550;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 20px;
+      position: relative;
+    }}
+    .stock-card .rank-badge {{
+      position: absolute;
+      top: -12px;
+      left: 20px;
+      background: #4fc3f7;
+      color: #0f1117;
+      font-weight: bold;
+      font-size: 0.85rem;
+      padding: 2px 12px;
+      border-radius: 12px;
+    }}
+    .stock-header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 16px;
+    }}
+    .stock-name {{ font-size: 1.2rem; font-weight: bold; color: #e8e8e8; }}
+    .stock-ticker {{ color: #90a4ae; font-size: 0.85rem; margin-top: 4px; }}
+    .stock-price {{ text-align: right; }}
+    .stock-price .price {{ font-size: 1.4rem; color: #4fc3f7; font-weight: bold; }}
+    .stock-price .sector {{ color: #90a4ae; font-size: 0.8rem; margin-top: 4px; }}
+    .score-section {{
+      display: flex;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }}
+    .score-item {{
+      flex: 1;
+      min-width: 120px;
+      background: #0f1117;
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }}
+    .score-item .score-label {{ color: #90a4ae; font-size: 0.7rem; margin-bottom: 6px; }}
+    .score-item .score-bar-bg {{
+      background: #2a3550;
+      border-radius: 4px;
+      height: 6px;
+      margin-bottom: 6px;
+    }}
+    .score-item .score-bar {{ border-radius: 4px; height: 6px; }}
+    .score-item .score-value {{ font-size: 0.9rem; font-weight: bold; }}
+    .total-score {{
+      font-size: 1.8rem;
+      font-weight: bold;
+      color: #ffd700;
+      text-align: center;
+      padding: 8px 16px;
+      background: #0f1117;
+      border-radius: 8px;
+    }}
+    .total-label {{ font-size: 0.7rem; color: #90a4ae; }}
+    .detail-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }}
+    .detail-item {{
+      background: #0f1117;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 0.8rem;
+    }}
+    .detail-item .d-label {{ color: #90a4ae; margin-bottom: 3px; }}
+    .detail-item .d-value {{ color: #cfd8dc; }}
+    .footer {{
+      text-align: center;
+      color: #546e7a;
+      font-size: 0.75rem;
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid #2a3550;
+    }}
+    .disclaimer {{
+      background: #1a1f2e;
+      border-left: 3px solid #f44336;
+      padding: 12px 16px;
+      border-radius: 0 8px 8px 0;
+      font-size: 0.78rem;
+      color: #90a4ae;
+      margin-bottom: 24px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>株式推奨レポート</h1>
+    <div class="subtitle">{date} 生成 ／ 東証プライム市場 ／ 翌営業日推奨銘柄</div>
+  </div>
+
+  <div class="disclaimer">
+    本レポートは情報提供のみを目的としており、投資勧誘を意図するものではありません。
+    投資判断はご自身の責任において行ってください。
+  </div>
+
+  <div class="summary-bar">
+    <div class="summary-card">
+      <div class="label">スクリーニング対象</div>
+      <div class="value">{total_screened}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">流動性通過</div>
+      <div class="value">{liquidity_passed}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">最終推奨銘柄</div>
+      <div class="value">{top_n}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">最高スコア</div>
+      <div class="value">{top_score:.1f}</div>
+    </div>
+  </div>
+
+  {stock_cards}
+
+  <div class="footer">
+    Generated by 株式投資支援ツール ／ データソース: Yahoo Finance<br>
+    スコアリング: テクニカル60点 + ファンダメンタル40点 = 100点満点
+  </div>
+</body>
+</html>
+"""
+
+STOCK_CARD_TEMPLATE = """
+  <div class="stock-card">
+    <div class="rank-badge">#{rank} 推奨</div>
+    <div class="stock-header">
+      <div>
+        <div class="stock-name">{name}</div>
+        <div class="stock-ticker">{ticker}</div>
+      </div>
+      <div class="stock-price">
+        <div class="price">¥{last_close:,.0f}</div>
+        <div class="sector">{sector}</div>
+      </div>
+    </div>
+
+    <div class="score-section">
+      <div class="score-item">
+        <div class="score-label">トレンド</div>
+        <div class="score-bar-bg"><div class="score-bar" style="width:{trend_pct}%;background:#4fc3f7;"></div></div>
+        <div class="score-value" style="color:#4fc3f7;">{trend:.1f}/15</div>
+      </div>
+      <div class="score-item">
+        <div class="score-label">モメンタム</div>
+        <div class="score-bar-bg"><div class="score-bar" style="width:{momentum_pct}%;background:#81c784;"></div></div>
+        <div class="score-value" style="color:#81c784;">{momentum:.1f}/15</div>
+      </div>
+      <div class="score-item">
+        <div class="score-label">出来高</div>
+        <div class="score-bar-bg"><div class="score-bar" style="width:{volume_pct}%;background:#ffb74d;"></div></div>
+        <div class="score-value" style="color:#ffb74d;">{volume:.1f}/15</div>
+      </div>
+      <div class="score-item">
+        <div class="score-label">値動き</div>
+        <div class="score-bar-bg"><div class="score-bar" style="width:{price_action_pct}%;background:#f48fb1;"></div></div>
+        <div class="score-value" style="color:#f48fb1;">{price_action:.1f}/15</div>
+      </div>
+      <div class="score-item">
+        <div class="score-label">米国連動</div>
+        <div class="score-bar-bg"><div class="score-bar" style="width:{us_pct}%;background:#ce93d8;"></div></div>
+        <div class="score-value" style="color:#ce93d8;">{us_market:.1f}/10</div>
+      </div>
+      <div class="score-item">
+        <div class="score-label">バリュエーション</div>
+        <div class="score-bar-bg"><div class="score-bar" style="width:{val_pct}%;background:#80cbc4;"></div></div>
+        <div class="score-value" style="color:#80cbc4;">{valuation:.1f}/5</div>
+      </div>
+      <div class="score-item">
+        <div class="score-label">業績</div>
+        <div class="score-bar-bg"><div class="score-bar" style="width:{earn_pct}%;background:#fff176;"></div></div>
+        <div class="score-value" style="color:#fff176;">{earnings:.1f}/10</div>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:center;min-width:100px;">
+        <div>
+          <div class="total-label" style="text-align:center;">総合スコア</div>
+          <div class="total-score">{total:.1f}</div>
+          <div class="total-label" style="text-align:center;">/100点</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="detail-grid">
+      <div class="detail-item">
+        <div class="d-label">トレンド分析</div>
+        <div class="d-value">{detail_trend}</div>
+      </div>
+      <div class="detail-item">
+        <div class="d-label">モメンタム</div>
+        <div class="d-value">{detail_momentum}</div>
+      </div>
+      <div class="detail-item">
+        <div class="d-label">出来高</div>
+        <div class="d-value">{detail_volume}</div>
+      </div>
+      <div class="detail-item">
+        <div class="d-label">値動き</div>
+        <div class="d-value">{detail_price_action}</div>
+      </div>
+      <div class="detail-item">
+        <div class="d-label">米国市場</div>
+        <div class="d-value">{detail_us_market}</div>
+      </div>
+      <div class="detail-item">
+        <div class="d-label">バリュエーション</div>
+        <div class="d-value">{detail_valuation}</div>
+      </div>
+      <div class="detail-item" style="grid-column: span 2;">
+        <div class="d-label">業績トレンド</div>
+        <div class="d-value">{detail_earnings}</div>
+      </div>
+    </div>
+  </div>
+"""
+
+
+def generate_html_report(
+    recommendations: list[dict],
+    total_screened: int,
+    liquidity_passed: int,
+    output_dir: str = "reports",
+) -> str:
+    """
+    HTMLレポートを生成してファイルパスを返す
+
+    Args:
+        recommendations: スコアリング済み推奨銘柄リスト
+        total_screened: スクリーニング対象総数
+        liquidity_passed: 流動性フィルター通過数
+        output_dir: 出力ディレクトリ
+
+    Returns:
+        生成されたHTMLファイルのパス
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    file_date = datetime.now().strftime("%Y%m%d_%H%M")
+
+    stock_cards_html = ""
+    for rank, rec in enumerate(recommendations, 1):
+        td = rec.get("technical_details", {})
+        fd = rec.get("fundamental_details", {})
+
+        card = STOCK_CARD_TEMPLATE.format(
+            rank=rank,
+            name=rec.get("name", rec["ticker"]),
+            ticker=rec["ticker"],
+            last_close=td.get("last_close", 0),
+            sector=rec.get("sector", "不明"),
+            trend=rec.get("trend", 0),
+            trend_pct=rec.get("trend", 0) / 15 * 100,
+            momentum=rec.get("momentum", 0),
+            momentum_pct=rec.get("momentum", 0) / 15 * 100,
+            volume=rec.get("volume", 0),
+            volume_pct=rec.get("volume", 0) / 15 * 100,
+            price_action=rec.get("price_action", 0),
+            price_action_pct=rec.get("price_action", 0) / 15 * 100,
+            us_market=rec.get("us_market", 0),
+            us_pct=rec.get("us_market", 0) / 10 * 100,
+            valuation=rec.get("valuation", 0),
+            val_pct=rec.get("valuation", 0) / 5 * 100,
+            earnings=rec.get("earnings", 0),
+            earn_pct=rec.get("earnings", 0) / 10 * 100,
+            total=rec.get("total_score", 0),
+            detail_trend=td.get("trend", "—"),
+            detail_momentum=td.get("momentum", "—"),
+            detail_volume=td.get("volume", "—"),
+            detail_price_action=td.get("price_action", "—"),
+            detail_us_market=fd.get("us_market", "—"),
+            detail_valuation=fd.get("valuation", "—"),
+            detail_earnings=fd.get("earnings", "—"),
+        )
+        stock_cards_html += card
+
+    top_score = recommendations[0]["total_score"] if recommendations else 0
+
+    html = TEMPLATE.format(
+        date=date_str,
+        total_screened=total_screened,
+        liquidity_passed=liquidity_passed,
+        top_n=len(recommendations),
+        top_score=top_score,
+        stock_cards=stock_cards_html,
+    )
+
+    output_path = os.path.join(output_dir, f"report_{file_date}.html")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    return output_path
