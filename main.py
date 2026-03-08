@@ -12,8 +12,11 @@ import logging
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).parent
 
 from kabu.screener import get_prime_tickers, apply_liquidity_filter
 from kabu.technical import calc_technical_score
@@ -23,13 +26,18 @@ from kabu.notifier import send_report_email
 
 load_dotenv()
 
+LOG_DIR = BASE_DIR / "logs"
+REPORT_DIR = BASE_DIR / "reports"
+LOG_DIR.mkdir(exist_ok=True)
+REPORT_DIR.mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(
-            os.path.join("logs", f"run_{datetime.now().strftime('%Y%m%d')}.log"),
+            LOG_DIR / f"run_{datetime.now().strftime('%Y%m%d')}.log",
             encoding="utf-8",
         ),
     ],
@@ -113,7 +121,7 @@ def run(top_n: int = 5, dry_run: bool = False):
         recommendations=recommendations,
         total_screened=total_screened,
         liquidity_passed=liquidity_passed,
-        output_dir="reports",
+        output_dir=str(REPORT_DIR),
     )
     logger.info(f"レポート保存: {report_path}")
 
@@ -153,9 +161,6 @@ def main():
     parser.add_argument("--top-n", type=int, default=int(os.getenv("TOP_N", 5)), help="推奨銘柄数（デフォルト: 5）")
     parser.add_argument("--dry-run", action="store_true", help="メール送信なしで動作確認")
     args = parser.parse_args()
-
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("reports", exist_ok=True)
 
     run(top_n=args.top_n, dry_run=args.dry_run)
 
