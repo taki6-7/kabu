@@ -17,7 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
-load_dotenv()
+load_dotenv(BASE_DIR / ".env")
 
 LOG_DIR = BASE_DIR / "logs"
 REPORT_DIR = BASE_DIR / "reports"
