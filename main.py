@@ -17,13 +17,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
-
-from kabu.screener import get_prime_tickers, apply_liquidity_filter
-from kabu.technical import calc_technical_score
-from kabu.fundamental import calc_fundamental_score
-from kabu.reporter import generate_html_report
-from kabu.notifier import send_report_email
-
 load_dotenv()
 
 LOG_DIR = BASE_DIR / "logs"
@@ -43,6 +36,16 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+try:
+    from kabu.screener import get_prime_tickers, apply_liquidity_filter
+    from kabu.technical import calc_technical_score
+    from kabu.fundamental import calc_fundamental_score
+    from kabu.reporter import generate_html_report
+    from kabu.notifier import send_report_email
+except Exception as _import_err:
+    logger.exception(f"モジュールのインポートに失敗しました: {_import_err}")
+    sys.exit(1)
 
 
 def run(top_n: int = 5, dry_run: bool = False):
@@ -166,4 +169,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.exception(f"致命的エラーが発生しました: {e}")
+        sys.exit(1)
