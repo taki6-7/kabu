@@ -19,6 +19,17 @@ if %errorlevel% neq 0 (
     goto :END
 )
 
+REM --- 依存パッケージのインストール確認 ---
+echo [準備] 必要なパッケージを確認しています...
+python -m pip install -r requirements.txt --quiet
+if %errorlevel% neq 0 (
+    echo [エラー] パッケージのインストールに失敗しました。
+    echo         インターネット接続を確認してください。
+    goto :END
+)
+echo [準備完了] パッケージの確認が完了しました。
+echo.
+
 REM --- 実行 ---
 python main.py %*
 set EXIT_CODE=%errorlevel%
