@@ -133,9 +133,9 @@ def run(top_n: int = 5, dry_run: bool = False):
         logger.info("Step 6: [DRY-RUN] メール送信スキップ")
     else:
         logger.info("Step 6: Gmail送信")
-        gmail_address = os.getenv("GMAIL_ADDRESS")
-        app_password = os.getenv("GMAIL_APP_PASSWORD")
-        notify_to = os.getenv("NOTIFY_TO")
+        gmail_address = (os.getenv("GMAIL_ADDRESS") or "").strip()
+        app_password = (os.getenv("GMAIL_APP_PASSWORD") or "").strip()
+        notify_to = (os.getenv("NOTIFY_TO") or "").strip()
 
         if not all([gmail_address, app_password, notify_to]):
             logger.warning(".envにGmail設定がありません。メール送信をスキップします。")

@@ -94,12 +94,17 @@ def send_report_email(
         logger.info(f"メール送信完了: {to_address}")
         return True
 
-    except smtplib.SMTPAuthenticationError:
-        logger.error("Gmail認証エラー: アドレスまたはアプリパスワードを確認してください")
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error(f"Gmail認証エラー (535): アドレスまたはアプリパスワードが間違っています: {e}")
+        logger.error("  → Googleの「アプリパスワード」を使っているか確認してください（通常のパスワード不可）")
+        logger.error("  → 2段階認証が有効になっているか確認してください")
         return False
     except smtplib.SMTPException as e:
-        logger.error(f"SMTP送信エラー: {e}")
+        logger.error(f"SMTP送信エラー [{type(e).__name__}]: {e}")
+        return False
+    except OSError as e:
+        logger.error(f"ネットワークエラー: smtp.gmail.com:465 に接続できません: {e}")
         return False
     except Exception as e:
-        logger.error(f"メール送信エラー: {e}")
+        logger.error(f"メール送信エラー [{type(e).__name__}]: {e}")
         return False
