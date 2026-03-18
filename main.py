@@ -11,10 +11,30 @@ import argparse
 import logging
 import os
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
+# --- 早期クラッシュをファイルに記録するための仕組み ---
+# logging初期化より前のエラー（ImportErrorなど）を logs/crash.log に書き出す
+_BASE_DIR_EARLY = Path(__file__).parent
+_CRASH_LOG = _BASE_DIR_EARLY / "logs" / "crash.log"
+
+def _write_crash(msg: str):
+    try:
+        (_BASE_DIR_EARLY / "logs").mkdir(exist_ok=True)
+        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass  # クラッシュログ自体が失敗しても無視
+
+try:
+    from dotenv import load_dotenv
+except ImportError as _e:
+    _write_crash(f"ImportError: {_e}\n実行前に 'pip install -r requirements.txt' を実行してください。")
+    print(f"[エラー] 必要なパッケージが不足しています: {_e}", file=sys.stderr)
+    print("  run.bat を使って起動するか、'pip install -r requirements.txt' を実行してください。", file=sys.stderr)
+    sys.exit(1)
 
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")

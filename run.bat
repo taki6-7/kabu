@@ -30,6 +30,9 @@ if %errorlevel% neq 0 (
 echo [準備完了] パッケージの確認が完了しました。
 echo.
 
+REM --- ログフォルダを事前作成 ---
+if not exist logs mkdir logs
+
 REM --- 実行 ---
 python main.py %*
 set EXIT_CODE=%errorlevel%
@@ -37,7 +40,11 @@ set EXIT_CODE=%errorlevel%
 echo.
 if %EXIT_CODE% neq 0 (
     echo [エラー] ツールがエラーコード %EXIT_CODE% で終了しました。
-    echo         詳細は logs\ フォルダのログファイルを参照してください。
+    if exist logs\crash.log (
+        echo         クラッシュ詳細: logs\crash.log
+    ) else (
+        echo         詳細は logs\ フォルダのログファイルを参照してください。
+    )
 ) else (
     echo [完了] 正常に終了しました。レポートは reports\ フォルダに保存されています。
 )
