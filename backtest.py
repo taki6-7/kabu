@@ -30,7 +30,7 @@ from kabu.technical import score_trend, score_momentum, score_volume, score_pric
 # ─────────────────────────────────────────────
 BENCHMARK_TICKER = "^N225"
 INITIAL_CAPITAL = 1_000_000   # 初期資金 ¥100万
-COMMISSION_RATE = 0.001        # 片道0.1%手数料（日次取引は信用取引等で低減可能）
+COMMISSION_RATE = 0.0005       # 片道0.05%手数料（SBI/楽天等のネット証券現実値）
 
 # 日次戦略用 ストップロス/テイクプロフィット
 TAKE_PROFIT_PCT = 0.03   # +3% でテイクプロフィット
@@ -186,13 +186,34 @@ def _simulate_exit(df: pd.DataFrame, entry_date: pd.Timestamp,
     return next_close, "引け決済"
 
 
+def _mark_to_market(holdings: dict, all_data: dict, date: pd.Timestamp,
+                    cash: float) -> float:
+    """保有銘柄の時価評価額 + 現金"""
+    total = cash
+    for ticker, (entry_price, shares, _) in holdings.items():
+        df = all_data.get(ticker)
+        if df is not None:
+            future = df[df.index >= date]
+            price = float(future["Close"].iloc[0]) if len(future) > 0 else entry_price
+        else:
+            price = entry_price
+        total += shares * price
+    return total
+
+
 def run_backtest(all_data: dict, rebalance_dates: list, top_n: int,
                  use_sl_tp: bool = False) -> dict:
-    """ウォークフォワード・バックテスト実行"""
+    """ウォークフォワード・バックテスト実行（スマートリバランス）
+
+    毎回全売買するのではなく、TOP-Nの構成が変わった銘柄だけ売買する。
+    手数料ダメージを大幅に削減できる。
+    """
     capital = float(INITIAL_CAPITAL)
-    current_holdings = []   # list of (ticker, entry_price, shares, entry_date)
+    # {ticker: (entry_price, shares, entry_date)}
+    holdings: dict = {}
     trades = []
     portfolio_values = []
+    daily_turnover = []
 
     for i, date in enumerate(rebalance_dates[:-1]):
         # ── スコア計算（date以前のデータのみ使用） ──
@@ -204,15 +225,39 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int,
                 scores[ticker] = score
 
         if not scores:
-            portfolio_values.append({"date": date.isoformat(), "value": capital,
+            # ポートフォリオ現在価値を時価評価して記録
+            pv = _mark_to_market(holdings, all_data, date, capital)
+            portfolio_values.append({"date": date.isoformat(), "value": round(pv, 0),
                                      "top_tickers": [], "top_scores": {}})
+            capital = pv
             continue
 
-        top_tickers = sorted(scores, key=lambda x: scores[x], reverse=True)[:top_n]
+        top_set = set(sorted(scores, key=lambda x: scores[x], reverse=True)[:top_n])
+        current_set = set(holdings.keys())
 
-        # ── 前回ポジション清算 ──
-        exit_value = 0.0
-        for ticker, entry_price, shares, entry_date in current_holdings:
+        to_sell = current_set - top_set   # 今日外れた銘柄 → 売却
+        to_buy  = top_set - current_set   # 今日新たに入った銘柄 → 購入
+        to_keep = current_set & top_set   # 継続保有（SL/TPチェックのみ）
+
+        # ── SL/TPチェック（継続保有銘柄も含む） ──
+        if use_sl_tp:
+            for ticker in list(to_keep):
+                entry_price, shares, entry_date = holdings[ticker]
+                df = all_data.get(ticker)
+                if df is None:
+                    continue
+                exit_price, exit_reason = _simulate_exit(df, entry_date, entry_price, True)
+                # SLかTPが発動した場合は売却扱いにする
+                if exit_reason != "引け決済":
+                    to_sell.add(ticker)
+                    to_keep.discard(ticker)
+
+        # ── 売却処理 ──
+        sell_proceeds = 0.0
+        for ticker in to_sell:
+            if ticker not in holdings:
+                continue
+            entry_price, shares, entry_date = holdings.pop(ticker)
             df = all_data.get(ticker)
             if df is not None:
                 exit_price, exit_reason = _simulate_exit(df, entry_date, entry_price, use_sl_tp)
@@ -221,7 +266,7 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int,
 
             gross = shares * exit_price
             net = gross - gross * COMMISSION_RATE
-            exit_value += net
+            sell_proceeds += net
 
             pnl_pct = (exit_price / entry_price - 1) * 100 if entry_price > 0 else 0
             trades.append({
@@ -234,53 +279,65 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int,
                 "pnl": round(net - shares * entry_price, 0),
             })
 
-        if current_holdings:
-            capital = exit_value
+        capital += sell_proceeds
 
-        # ── 新規ポジション構築 ──
-        per_stock = capital / top_n
-        new_holdings = []
-        for ticker in top_tickers:
-            df = all_data.get(ticker)
-            if df is None:
-                continue
-            future = df[df.index >= date]
-            if len(future) == 0:
-                continue
-            entry_price = float(future["Close"].iloc[0])
-            invest = per_stock - per_stock * COMMISSION_RATE
-            shares = invest / entry_price if entry_price > 0 else 0
-            new_holdings.append((ticker, entry_price, shares, date))
+        # ── 購入処理（新規エントリー銘柄を均等配分） ──
+        if to_buy:
+            # 空きスロット数に応じて資金配分
+            slots = len(to_buy)
+            total_slots = top_n
+            free_capital = capital * (slots / total_slots)
+            per_stock = free_capital / slots if slots > 0 else 0
 
-        current_holdings = new_holdings
+            for ticker in to_buy:
+                df = all_data.get(ticker)
+                if df is None:
+                    continue
+                future = df[df.index >= date]
+                if len(future) == 0:
+                    continue
+                entry_price = float(future["Close"].iloc[0])
+                invest = per_stock - per_stock * COMMISSION_RATE
+                shares = invest / entry_price if entry_price > 0 else 0
+                capital -= per_stock
+                holdings[ticker] = (entry_price, shares, date)
+
+        # ── 時価評価 ──
+        pv = _mark_to_market(holdings, all_data, date, capital)
+        turnover_rate = len(to_sell) / top_n * 100 if top_n > 0 else 0
+        daily_turnover.append(turnover_rate)
 
         portfolio_values.append({
             "date": date.isoformat(),
-            "value": round(capital, 0),
-            "top_tickers": top_tickers,
-            "top_scores": {t: round(scores[t], 1) for t in top_tickers},
+            "value": round(pv, 0),
+            "top_tickers": sorted(top_set),
+            "top_scores": {t: round(scores[t], 1) for t in top_set if t in scores},
+            "traded": len(to_sell),
         })
 
-        logger.info(
-            f"{date.date()} | 資産: ¥{capital:>10,.0f} | "
-            f"TOP{top_n}: {', '.join(top_tickers[:3])}"
-        )
+        if i % 20 == 0:  # 20営業日ごとにログ出力
+            logger.info(
+                f"{date.date()} | 資産: ¥{pv:>10,.0f} | "
+                f"売買:{len(to_sell)}件 | 保有:{len(holdings)}銘柄"
+            )
+
+    avg_turnover = float(np.mean(daily_turnover)) if daily_turnover else 0
+    logger.info(f"平均日次ターンオーバー率: {avg_turnover:.1f}%")
 
     # ── 最終清算 ──
-    final_value = 0.0
-    for ticker, entry_price, shares, entry_date in current_holdings:
+    # ── 最終清算 ──
+    final_value = capital
+    for ticker, (entry_price, shares, _) in holdings.items():
         df = all_data.get(ticker)
         last_price = float(df["Close"].iloc[-1]) if df is not None else entry_price
         gross = shares * last_price
         final_value += gross - gross * COMMISSION_RATE
 
-    if current_holdings:
-        capital = final_value
-
     return {
         "trades": trades,
         "portfolio_values": portfolio_values,
-        "final_capital": round(capital, 0),
+        "final_capital": round(final_value, 0),
+        "avg_daily_turnover": round(avg_turnover, 1),
     }
 
 
@@ -358,6 +415,7 @@ def calc_metrics(result: dict, benchmark_data: pd.DataFrame) -> dict:
         "total_trades":        len(trades),
         "tp_count":            tp_count,
         "sl_count":            sl_count,
+        "avg_daily_turnover":  result.get("avg_daily_turnover", 0),
         "benchmark_return_pct": round(bm_return, 2),
         "alpha_pct":           round(total_return - bm_return, 2),
         "initial_capital":     INITIAL_CAPITAL,
