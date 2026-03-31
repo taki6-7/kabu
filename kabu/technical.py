@@ -182,13 +182,31 @@ def score_volume(volume: pd.Series) -> tuple[float, str]:
         return 0.0, f"出来高減少({ratio:.2f}倍)"
 
 
+def _calc_bollinger(close: pd.Series, period: int = 20, std_dev: float = 2.0):
+    """ボリンジャーバンド計算（中央線・上限・下限）"""
+    mid   = close.rolling(period).mean()
+    sigma = close.rolling(period).std(ddof=0)
+    upper = mid + std_dev * sigma
+    lower = mid - std_dev * sigma
+    return mid, upper, lower
+
+
 def score_price_action(high: pd.Series, low: pd.Series,
                        close: pd.Series, open_: pd.Series) -> tuple[float, str]:
-    """ブレイクアウトスコア（15点）
+    """ボリンジャーバンド + 引け足スコア（15点）
 
-    20日高値ブレイクアウト（重要な抵抗線突破）は翌日の追随買いを呼ぶ。
-    引け足が高位置（上髭なし）であれば更にポジティブ。
-    5日高値ブレイクより20日高値の方が市場参加者に意識される。
+    【バンドウォーク検出（8点）】
+    上のバンドを伝って上昇し続ける「バンドウォーク」は
+    強いトレンドの証拠。以下の段階で評価する:
+      - 3日連続でアッパーバンド以上 = バンドウォーク確定(8点)
+      - 当日アッパーバンド以上      = バンドタッチ(6点)
+      - アッパーバンドの2%以内      = バンド接近(4点)
+      - 中心線より上               = ミドル上位(2点)
+      - 中心線以下                 = 対象外(0点)
+
+    【引け足強度（7点）】
+    日中値幅の何%の位置で引けたか。
+    高値引け（上髭なし）は翌日続伸サイン。
     """
     if len(close) < 25:
         return 0.0, "データ不足"
@@ -198,13 +216,28 @@ def score_price_action(high: pd.Series, low: pd.Series,
     last_low   = _safe_last(low)
     last_open  = _safe_last(open_)
 
-    # 20日高値ブレイクアウト（8点）
-    high20 = high.rolling(20).max()
-    prev_high20 = float(high20.iloc[-2]) if len(high20) >= 2 and pd.notna(high20.iloc[-2]) else float(_safe_last(high20))
-    pct_from_20d = (last_close / float(_safe_last(high20)) - 1) * 100 if _safe_last(high20) > 0 else -100
-    is_breakout_20d = last_close > prev_high20
+    # ── ボリンジャーバンド計算 ──
+    mid, upper, lower = _calc_bollinger(close)
+    upper_val = _safe_last(upper)
+    mid_val   = _safe_last(mid)
 
-    # 引け位置スコア（7点）: 日中値幅の何%の位置で引けたか
+    # バンドウォーク判定（直近3日連続でアッパーバンド以上かチェック）
+    if len(close) >= 3 and upper_val > 0:
+        band_walk_days = 0
+        for j in range(1, 4):  # 直近3日分
+            if len(close) >= j and len(upper) >= j:
+                c = close.iloc[-j]
+                u = upper.iloc[-j]
+                if pd.notna(c) and pd.notna(u) and float(c) >= float(u):
+                    band_walk_days += 1
+                else:
+                    break  # 連続が途切れたら終了
+    else:
+        band_walk_days = 0
+
+    pct_from_upper = (last_close / upper_val - 1) * 100 if upper_val > 0 else -100
+
+    # ── 引け位置スコア ──
     day_range = last_high - last_low
     close_pos = (last_close - last_low) / day_range * 100 if day_range > 0 else 50.0
     is_bullish = last_close > last_open
@@ -212,20 +245,23 @@ def score_price_action(high: pd.Series, low: pd.Series,
     score = 0.0
     notes = []
 
-    # 20日高値ブレイクアウト
-    if is_breakout_20d:
+    # バンドウォークスコア（8点）
+    if band_walk_days >= 3:
         score += 8.0
-        notes.append(f"20日高値ブレイク")
-    elif pct_from_20d >= -2.0:
-        score += 5.0
-        notes.append(f"20日高値付近({pct_from_20d:.1f}%)")
-    elif pct_from_20d >= -5.0:
+        notes.append(f"バンドウォーク{band_walk_days}日継続")
+    elif band_walk_days >= 1 or pct_from_upper >= 0:
+        score += 6.0
+        notes.append(f"アッパーバンドタッチ({pct_from_upper:+.1f}%)")
+    elif pct_from_upper >= -2.0:
+        score += 4.0
+        notes.append(f"バンド接近({pct_from_upper:.1f}%)")
+    elif last_close > mid_val and mid_val > 0:
         score += 2.0
-        notes.append(f"20日高値下({pct_from_20d:.1f}%)")
+        notes.append(f"ミドル上位({pct_from_upper:.1f}%)")
     else:
-        notes.append(f"20日高値乖離({pct_from_20d:.1f}%)")
+        notes.append(f"ミドル以下({pct_from_upper:.1f}%)")
 
-    # 引け位置
+    # 引け位置スコア（7点）
     if close_pos >= 75 and is_bullish:
         score += 7.0
         notes.append(f"高値引け({close_pos:.0f}%)")
