@@ -2,10 +2,10 @@
 テクニカル分析スコアリングモジュール（60点満点）
 
 シグナル内訳:
-  - トレンド    15点: パーフェクトオーダー（5MA > 25MA > 75MA）
-  - モメンタム  15点: RSI、MACDゴールデンクロス
-  - 出来高      15点: 直近出来高が20日平均の1.5倍以上
-  - 値動き      15点: 前日陽線、高値水準、ボラティリティ
+  - トレンド    15点: パーフェクトオーダー（5MA > 25MA > 75MA）+ MA上向き確認
+  - モメンタム  15点: RSI上昇モメンタム（55-75）、MACDゴールデンクロス
+  - 出来高      15点: 直近5日平均が20日平均の1.5倍以上（持続的な出来高増加）
+  - 値動き      15点: 前日陽線、20日高値ブレイクアウト、ボラティリティ
 """
 
 import logging
@@ -43,7 +43,9 @@ def _calc_macd(close: pd.Series):
 
 
 def score_trend(close: pd.Series) -> tuple[float, str]:
-    """トレンドスコア（15点）"""
+    """トレンドスコア（15点）
+    MA並び順に加えて、MA5が上向きかどうかでトレンドの強度を確認。
+    """
     if len(close) < 75:
         return 0.0, "データ不足"
 
@@ -53,12 +55,22 @@ def score_trend(close: pd.Series) -> tuple[float, str]:
 
     v5, v25, v75 = _safe_last(ma5), _safe_last(ma25), _safe_last(ma75)
 
+    # MA5が5日前より上向きか（トレンドが加速しているか確認）
+    ma5_prev = ma5.iloc[-6] if len(ma5) >= 6 and pd.notna(ma5.iloc[-6]) else v5
+    ma5_rising = v5 > float(ma5_prev)
+
     if v5 > v25 > v75:
-        return 15.0, f"パーフェクトオーダー (5MA:{v5:.0f} > 25MA:{v25:.0f} > 75MA:{v75:.0f})"
+        if ma5_rising:
+            return 15.0, f"パーフェクトオーダー+上向き (5MA:{v5:.0f} > 25MA:{v25:.0f} > 75MA:{v75:.0f})"
+        else:
+            return 12.0, f"パーフェクトオーダー (5MA:{v5:.0f} > 25MA:{v25:.0f} > 75MA:{v75:.0f})"
     elif v5 > v25:
-        return 8.0, f"短期上昇トレンド (5MA:{v5:.0f} > 25MA:{v25:.0f})"
+        if ma5_rising:
+            return 8.0, f"短期上昇トレンド+上向き (5MA:{v5:.0f} > 25MA:{v25:.0f})"
+        else:
+            return 5.0, f"短期上昇トレンド (5MA:{v5:.0f} > 25MA:{v25:.0f})"
     elif v25 > v75:
-        return 4.0, f"中期上昇トレンド (25MA:{v25:.0f} > 75MA:{v75:.0f})"
+        return 3.0, f"中期上昇トレンド (25MA:{v25:.0f} > 75MA:{v75:.0f})"
     else:
         return 0.0, f"下降トレンド (5MA:{v5:.0f}, 25MA:{v25:.0f}, 75MA:{v75:.0f})"
 
@@ -80,18 +92,20 @@ def score_momentum(close: pd.Series) -> tuple[float, str]:
     score = 0.0
     notes = []
 
-    # RSIスコア（8点）
-    if 40 <= rsi_val <= 60:
+    # RSIスコア（8点）- 上昇モメンタム重視
+    # 旧ロジック: RSI40-60（中立）に最高点 → 上昇力がない銘柄を優遇していた
+    # 新ロジック: RSI55-75（上昇モメンタムゾーン）に最高点
+    if 55 <= rsi_val <= 75:
         score += 8.0
-        notes.append(f"RSI適正({rsi_val:.1f})")
-    elif 35 <= rsi_val < 40 or 60 < rsi_val <= 65:
-        score += 4.0
-        notes.append(f"RSIやや適正({rsi_val:.1f})")
-    elif rsi_val < 30:
+        notes.append(f"RSI上昇モメンタム({rsi_val:.1f})")
+    elif 50 <= rsi_val < 55:
+        score += 5.0
+        notes.append(f"RSI強気圏({rsi_val:.1f})")
+    elif 45 <= rsi_val < 50:
         score += 2.0
-        notes.append(f"RSI売られ過ぎ({rsi_val:.1f})")
+        notes.append(f"RSI中立({rsi_val:.1f})")
     else:
-        notes.append(f"RSI過熱/低迷({rsi_val:.1f})")
+        notes.append(f"RSI{'過熱' if rsi_val > 75 else '弱気'}({rsi_val:.1f})")
 
     # MACDゴールデンクロス（7点）
     golden_cross = (prev_macd < prev_signal) and (macd_val > signal_val)
@@ -110,23 +124,26 @@ def score_momentum(close: pd.Series) -> tuple[float, str]:
 
 
 def score_volume(volume: pd.Series) -> tuple[float, str]:
-    """出来高スコア（15点）"""
+    """出来高スコア（15点）
+    直近1日スパイクではなく5日平均 vs 20日平均で持続的な出来高増加を確認。
+    """
     if len(volume) < 20:
         return 0.0, "データ不足"
 
+    avg5 = volume.rolling(5).mean()
     avg20 = volume.rolling(20).mean()
-    avg_val = _safe_last(avg20)
-    last_vol = _safe_last(volume)
+    avg5_val = _safe_last(avg5)
+    avg20_val = _safe_last(avg20)
 
-    if avg_val == 0:
+    if avg20_val == 0:
         return 0.0, "出来高データなし"
 
-    ratio = last_vol / avg_val
+    ratio = avg5_val / avg20_val  # 直近5日平均 / 20日平均
 
-    if ratio >= 2.0:
-        return 15.0, f"出来高急増({ratio:.1f}倍)"
-    elif ratio >= 1.5:
-        return 10.0, f"出来高増加({ratio:.1f}倍)"
+    if ratio >= 1.8:
+        return 15.0, f"出来高継続急増({ratio:.1f}倍)"
+    elif ratio >= 1.4:
+        return 10.0, f"出来高継続増加({ratio:.1f}倍)"
     elif ratio >= 1.0:
         return 5.0, f"出来高平均並み({ratio:.1f}倍)"
     else:
@@ -143,9 +160,12 @@ def score_price_action(high: pd.Series, low: pd.Series, close: pd.Series, open_:
     last_close = _safe_last(close)
     is_bullish = last_close > last_open
 
-    # 52週高値からの乖離（5点）
-    high52w = high.rolling(252).max().iloc[-1] if len(high) >= 252 else high.max()
-    pct_from_high = (last_close / float(high52w) - 1) * 100 if float(high52w) > 0 else -100
+    # 20日高値ブレイクアウト（5点）
+    # 52週高値乖離より明確な上昇シグナル：直近20日高値を上抜けたか
+    high20 = high.rolling(20).max()
+    prev_high20 = float(high20.iloc[-2]) if len(high20) >= 2 and pd.notna(high20.iloc[-2]) else float(_safe_last(high20))
+    pct_from_20d_high = (last_close / float(_safe_last(high20)) - 1) * 100 if _safe_last(high20) > 0 else -100
+    is_breakout_20d = last_close > prev_high20
 
     # ATR（ボラティリティ適度さ）（5点）
     tr = pd.concat([
@@ -165,14 +185,14 @@ def score_price_action(high: pd.Series, low: pd.Series, close: pd.Series, open_:
     else:
         notes.append("陰線")
 
-    if pct_from_high >= -5:
+    if is_breakout_20d:
         score += 5.0
-        notes.append(f"高値近辺({pct_from_high:.1f}%)")
-    elif pct_from_high >= -15:
+        notes.append(f"20日高値ブレイク({pct_from_20d_high:.1f}%)")
+    elif pct_from_20d_high >= -5:
         score += 2.0
-        notes.append(f"高値からやや下({pct_from_high:.1f}%)")
+        notes.append(f"20日高値付近({pct_from_20d_high:.1f}%)")
     else:
-        notes.append(f"高値から乖離({pct_from_high:.1f}%)")
+        notes.append(f"20日高値から乖離({pct_from_20d_high:.1f}%)")
 
     if 1.0 <= atr_pct <= 3.0:
         score += 5.0
