@@ -30,7 +30,11 @@ from kabu.technical import score_trend, score_momentum, score_volume, score_pric
 # ─────────────────────────────────────────────
 BENCHMARK_TICKER = "^N225"
 INITIAL_CAPITAL = 1_000_000   # 初期資金 ¥100万
-COMMISSION_RATE = 0.001        # 片道0.1%手数料
+COMMISSION_RATE = 0.001        # 片道0.1%手数料（日次取引は信用取引等で低減可能）
+
+# 日次戦略用 ストップロス/テイクプロフィット
+TAKE_PROFIT_PCT = 0.03   # +3% でテイクプロフィット
+STOP_LOSS_PCT   = 0.02   # -2% でストップロス
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,7 +118,10 @@ def get_rebalance_dates(start: pd.Timestamp, end: pd.Timestamp, frequency: str) 
     """リバランス日付リストを生成（営業日ベース）"""
     bdays = pd.bdate_range(start=start, end=end, freq="B")
 
-    if frequency == "weekly":
+    if frequency == "daily":
+        return list(bdays)
+
+    elif frequency == "weekly":
         dates, last_key = [], None
         for d in bdays:
             key = (d.year, d.isocalendar()[1])
@@ -144,10 +151,46 @@ def get_rebalance_dates(start: pd.Timestamp, end: pd.Timestamp, frequency: str) 
 # バックテスト本体
 # ─────────────────────────────────────────────
 
-def run_backtest(all_data: dict, rebalance_dates: list, top_n: int) -> dict:
+def _simulate_exit(df: pd.DataFrame, entry_date: pd.Timestamp,
+                   entry_price: float, use_sl_tp: bool) -> tuple:
+    """翌営業日のOHLCデータでSL/TP発動をシミュレート。
+    日次OHLCV使用のため安値がSL以下なら-2%、高値がTP以上なら+3%で約定と仮定。
+    Returns: (exit_price, exit_reason)
+    """
+    future = df[df.index > entry_date]
+    if len(future) == 0:
+        return entry_price, "データなし"
+
+    next_row = future.iloc[0]
+    next_high  = float(next_row["High"])
+    next_low   = float(next_row["Low"])
+    next_close = float(next_row["Close"])
+
+    if use_sl_tp:
+        tp_price = entry_price * (1 + TAKE_PROFIT_PCT)
+        sl_price = entry_price * (1 - STOP_LOSS_PCT)
+
+        # 寄り付きギャップダウンでSL以下になった場合は翌日始値で決済
+        next_open = float(next_row["Open"]) if "Open" in next_row else next_close
+        if next_open <= sl_price:
+            return next_open, f"ギャップダウンSL"
+
+        # 安値がSL以下 → SL発動
+        if next_low <= sl_price:
+            return sl_price, f"SL(-{STOP_LOSS_PCT*100:.0f}%)"
+        # 高値がTP以上 → TP発動
+        if next_high >= tp_price:
+            return tp_price, f"TP(+{TAKE_PROFIT_PCT*100:.0f}%)"
+
+    # 翌日引けで決済
+    return next_close, "引け決済"
+
+
+def run_backtest(all_data: dict, rebalance_dates: list, top_n: int,
+                 use_sl_tp: bool = False) -> dict:
     """ウォークフォワード・バックテスト実行"""
     capital = float(INITIAL_CAPITAL)
-    current_holdings = []   # list of (ticker, entry_price, shares)
+    current_holdings = []   # list of (ticker, entry_price, shares, entry_date)
     trades = []
     portfolio_values = []
 
@@ -169,13 +212,12 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int) -> dict:
 
         # ── 前回ポジション清算 ──
         exit_value = 0.0
-        for ticker, entry_price, shares in current_holdings:
+        for ticker, entry_price, shares, entry_date in current_holdings:
             df = all_data.get(ticker)
             if df is not None:
-                future = df[df.index >= date]
-                exit_price = float(future["Close"].iloc[0]) if len(future) > 0 else entry_price
+                exit_price, exit_reason = _simulate_exit(df, entry_date, entry_price, use_sl_tp)
             else:
-                exit_price = entry_price
+                exit_price, exit_reason = entry_price, "データなし"
 
             gross = shares * exit_price
             net = gross - gross * COMMISSION_RATE
@@ -187,6 +229,7 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int) -> dict:
                 "ticker": ticker,
                 "entry_price": round(entry_price, 2),
                 "exit_price": round(exit_price, 2),
+                "exit_reason": exit_reason,
                 "pnl_pct": round(pnl_pct, 2),
                 "pnl": round(net - shares * entry_price, 0),
             })
@@ -207,7 +250,7 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int) -> dict:
             entry_price = float(future["Close"].iloc[0])
             invest = per_stock - per_stock * COMMISSION_RATE
             shares = invest / entry_price if entry_price > 0 else 0
-            new_holdings.append((ticker, entry_price, shares))
+            new_holdings.append((ticker, entry_price, shares, date))
 
         current_holdings = new_holdings
 
@@ -225,7 +268,7 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int) -> dict:
 
     # ── 最終清算 ──
     final_value = 0.0
-    for ticker, entry_price, shares in current_holdings:
+    for ticker, entry_price, shares, entry_date in current_holdings:
         df = all_data.get(ticker)
         last_price = float(df["Close"].iloc[-1]) if df is not None else entry_price
         gross = shares * last_price
@@ -279,17 +322,21 @@ def calc_metrics(result: dict, benchmark_data: pd.DataFrame) -> dict:
         if losing and sum(t["pnl"] for t in losing) != 0 else float("inf")
     )
 
-    # 週次シャープレシオ
-    weekly_rets = []
+    # 日次シャープレシオ（年率換算）
+    daily_rets = []
     for i in range(1, len(pv)):
         p, c = pv[i - 1]["value"], pv[i]["value"]
         if p > 0:
-            weekly_rets.append((c - p) / p)
-    if weekly_rets:
-        mu, sigma = np.mean(weekly_rets), np.std(weekly_rets)
-        sharpe = float(mu / sigma * np.sqrt(52)) if sigma > 0 else 0.0
+            daily_rets.append((c - p) / p)
+    if daily_rets:
+        mu, sigma = np.mean(daily_rets), np.std(daily_rets)
+        sharpe = float(mu / sigma * np.sqrt(250)) if sigma > 0 else 0.0
     else:
         sharpe = 0.0
+
+    # TP/SL発動内訳
+    tp_count = len([t for t in trades if "TP" in t.get("exit_reason", "")])
+    sl_count = len([t for t in trades if "SL" in t.get("exit_reason", "")])
 
     # ベンチマーク(N225)リターン
     bm_start = benchmark_data[benchmark_data.index >= start_ts]
@@ -309,6 +356,8 @@ def calc_metrics(result: dict, benchmark_data: pd.DataFrame) -> dict:
         "avg_loss_pct":        round(avg_loss, 2),
         "profit_factor":       round(profit_factor, 2) if profit_factor != float("inf") else "∞",
         "total_trades":        len(trades),
+        "tp_count":            tp_count,
+        "sl_count":            sl_count,
         "benchmark_return_pct": round(bm_return, 2),
         "alpha_pct":           round(total_return - bm_return, 2),
         "initial_capital":     INITIAL_CAPITAL,
@@ -348,12 +397,13 @@ def generate_html_report(metrics: dict, result: dict, benchmark_data: pd.DataFra
                     bm_values.append(INITIAL_CAPITAL)
     chart_benchmark = json.dumps(bm_values)
 
-    # 最近20トレード（直近順）
+    # 最近30トレード（直近順）
     recent_trades = sorted(trades, key=lambda x: x["date"], reverse=True)[:30]
     trade_rows = ""
     for t in recent_trades:
         color = "#4ec9b0" if t["pnl"] > 0 else "#f48771"
         sign  = "+" if t["pnl"] > 0 else ""
+        reason = t.get("exit_reason", "")
         trade_rows += f"""
         <tr>
             <td>{t['date'][:10]}</td>
@@ -362,6 +412,7 @@ def generate_html_report(metrics: dict, result: dict, benchmark_data: pd.DataFra
             <td>¥{t['exit_price']:,.0f}</td>
             <td style="color:{color};">{sign}{t['pnl_pct']:.2f}%</td>
             <td style="color:{color};">{sign}¥{t['pnl']:,.0f}</td>
+            <td style="font-size:11px;color:#6c7086;">{reason}</td>
         </tr>"""
 
     # 指標カード
@@ -389,13 +440,16 @@ def generate_html_report(metrics: dict, result: dict, benchmark_data: pd.DataFra
     pf  = metrics.get("profit_factor", 0)
     fc  = metrics.get("final_capital", 0)
     yrs = metrics.get("backtest_years", 0)
+    tp_c = metrics.get("tp_count", 0)
+    sl_c = metrics.get("sl_count", 0)
+    total_t = metrics.get("total_trades", 0)
 
     cards = (
         metric_card("累計リターン", f"{'+' if tr >= 0 else ''}{tr:.2f}%", f"初期 ¥{INITIAL_CAPITAL:,} → 最終 ¥{fc:,}")
         + metric_card("年率リターン", f"{'+' if ar >= 0 else ''}{ar:.2f}%", f"期間 {yrs:.1f}年")
         + metric_card("最大ドローダウン", f"{dd:.2f}%", "低いほど良い", positive_good=False)
         + metric_card("シャープレシオ", f"{sh:.2f}", "1.0以上が目安")
-        + metric_card("勝率", f"{wr:.1f}%", f"総トレード: {metrics.get('total_trades', 0)}回")
+        + metric_card("勝率", f"{wr:.1f}%", f"総: {total_t}回 / TP: {tp_c}回 / SL: {sl_c}回")
         + metric_card("プロフィットファクター", str(pf), "1.0超で利益超過")
         + metric_card("N225リターン", f"{'+' if bm >= 0 else ''}{bm:.2f}%", "ベンチマーク")
         + metric_card("超過リターン(α)", f"{'+' if al >= 0 else ''}{al:.2f}%", "戦略 − N225")
@@ -450,7 +504,7 @@ def generate_html_report(metrics: dict, result: dict, benchmark_data: pd.DataFra
 <div class="section">
   <h2>直近トレード履歴</h2>
   <table>
-    <tr><th>日付</th><th>銘柄</th><th>エントリー</th><th>エグジット</th><th>損益(%)</th><th>損益(¥)</th></tr>
+    <tr><th>日付</th><th>銘柄</th><th>エントリー</th><th>エグジット</th><th>損益(%)</th><th>損益(¥)</th><th>決済理由</th></tr>
     {trade_rows}
   </table>
 </div>
@@ -526,10 +580,11 @@ new Chart(ctx, {{
 
 def main():
     parser = argparse.ArgumentParser(description="kabu バックテストエンジン")
-    parser.add_argument("--years",     type=float, default=2.0,     help="バックテスト期間（年）")
-    parser.add_argument("--top-n",     type=int,   default=5,       help="保有銘柄数")
-    parser.add_argument("--rebalance", type=str,   default="weekly",
-                        choices=["weekly", "biweekly", "monthly"],  help="リバランス頻度")
+    parser.add_argument("--years",     type=float, default=2.0,        help="バックテスト期間（年）")
+    parser.add_argument("--top-n",     type=int,   default=5,          help="保有銘柄数")
+    parser.add_argument("--rebalance", type=str,   default="daily",
+                        choices=["daily", "weekly", "biweekly", "monthly"], help="リバランス頻度")
+    parser.add_argument("--sl-tp",     action="store_true",             help="ストップロス/テイクプロフィットを有効化")
     args = parser.parse_args()
 
     end_date   = datetime.today()
@@ -553,8 +608,9 @@ def main():
     logger.info(f"リバランス日数: {len(rebalance_dates)} 回")
 
     # ── 3. バックテスト実行 ──
-    logger.info("バックテスト実行中...")
-    result = run_backtest(all_data, rebalance_dates, top_n=args.top_n)
+    use_sl_tp = args.sl_tp
+    logger.info(f"バックテスト実行中... SL/TP={'有効' if use_sl_tp else '無効'} (SL:-{STOP_LOSS_PCT*100:.0f}% / TP:+{TAKE_PROFIT_PCT*100:.0f}%)")
+    result = run_backtest(all_data, rebalance_dates, top_n=args.top_n, use_sl_tp=use_sl_tp)
 
     # ── 4. 指標計算 ──
     metrics = calc_metrics(result, benchmark_data)
@@ -571,6 +627,8 @@ def main():
     print(f"  最大DD       : {metrics.get('max_drawdown_pct', 0):.2f}%")
     print(f"  シャープ比   : {metrics.get('sharpe_ratio', 0):.2f}")
     print(f"  勝率         : {metrics.get('win_rate_pct', 0):.1f}%  ({metrics.get('total_trades', 0)}トレード)")
+    print(f"  TP発動       : {metrics.get('tp_count', 0)}回")
+    print(f"  SL発動       : {metrics.get('sl_count', 0)}回")
     print(f"  PF           : {metrics.get('profit_factor', 0)}")
     print(f"  最終資産     : ¥{metrics.get('final_capital', 0):,}")
     print("=" * 50 + "\n")
