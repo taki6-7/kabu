@@ -1,23 +1,27 @@
 """
 テクニカル分析スコアリングモジュール（60点満点）
 
-【設計思想：「上昇トレンド中の健全な押し目」を拾う】
+【設計思想：プロの実績ある手法を組み合わせる】
 
-過去の失敗分析:
-  - 5日急騰銘柄を選ぶ → すでに動き切り → 翌日反落（平均回帰）
-  - RSI(7)過熱ゾーン → 短期的買われすぎ → 翌日売り圧力
+1. Minerviniトレンドテンプレート（score_trend）
+   「Stage 2上昇トレンド」を5つの条件で判定。
+   機関投資家が買いやすい銘柄構造を再現。
 
-新方針:
-  - 中長期トレンドが上向きの銘柄を土台として選ぶ
-  - RSI(14)が健全ゾーン(50-68)にある = 過熱せず継続上昇中
-  - 出来高が緩やかに増加 = 機関が少しずつ買い集めている
-  - 20日高値ブレイク = 重要な抵抗線突破（追随買い発生しやすい）
+2. 12-1ヶ月モメンタム因子（score_momentum）
+   Jegadeesh-Titman(1993)の学術的に実証されたファクター。
+   「直近1ヶ月を除いた12ヶ月リターン」で短期反転ノイズを除去。
+
+3. 出来高蓄積（score_volume）
+   5日平均/20日平均比で機関の継続的な買い集めを捕捉。
+
+4. ボリンジャーバンド + 引け足（score_price_action）
+   バンドウォーク（上バンドを伝う上昇）でエントリータイミングを判定。
 
 シグナル内訳:
-  - トレンド品質  15点: MA並び順 + MAの傾き（上向きか）
-  - モメンタム健全性 15点: RSI(14)が50-68の健全ゾーン + MACD
-  - 出来高蓄積    15点: 5日平均が20日平均を上回る持続的増加
-  - ブレイクアウト  15点: 20日高値突破 + 引け足の強さ
+  - トレンドテンプレート  15点: Minervini 5条件のうち何条件満たすか
+  - 12-1ヶ月モメンタム   15点: 中期リターン + MACD確認
+  - 出来高蓄積           15点: 5日平均 / 20日平均比
+  - BBバンドウォーク      15点: アッパーバンド接触 + 高値引け
 """
 
 import logging
@@ -55,11 +59,19 @@ def _calc_macd(close: pd.Series):
 
 
 def score_trend(close: pd.Series) -> tuple[float, str]:
-    """トレンド品質スコア（15点）
+    """Minerviniトレンドテンプレート（15点）
 
-    MA並び順（5 > 25 > 75）+ MA5が上向き の組み合わせで
-    中長期的な上昇トレンドの強度を測定する。
-    5日急騰ではなく「継続的な上昇トレンドにあるか」を評価。
+    Mark MinerviniのSEPA手法をベースに「Stage 2上昇トレンド」を5条件で判定。
+    プロの機関投資家が買いやすい銘柄構造を数値化する。
+
+    条件（日本市場向けにMA期間を調整: 5/25/75日）:
+      1. 終値 > 25MA > 75MA  （価格がMAスタック上位）
+      2. 終値 > 5MA          （短期的にも強い）
+      3. 75MAが上向き         （長期トレンドが継続中）
+      4. 52週高値の75%以上    （過去1年の強さ: 25%以上の下落は除外）
+      5. 52週安値の130%以上   （しっかりした底からの上昇確認）
+
+    5条件達成: 15点 / 4条件: 11点 / 3条件: 6点 / 2条件: 2点 / それ以下: 0点
     """
     if len(close) < 75:
         return 0.0, "データ不足"
@@ -68,73 +80,101 @@ def score_trend(close: pd.Series) -> tuple[float, str]:
     ma25 = close.rolling(25).mean()
     ma75 = close.rolling(75).mean()
 
-    v5, v25, v75 = _safe_last(ma5), _safe_last(ma25), _safe_last(ma75)
+    v_close = float(close.iloc[-1])
+    v5  = _safe_last(ma5)
+    v25 = _safe_last(ma25)
+    v75 = _safe_last(ma75)
 
-    # MA5が5営業日前より上向きか（トレンドが継続加速しているか）
-    ma5_prev = ma5.iloc[-6] if len(ma5) >= 6 and pd.notna(ma5.iloc[-6]) else v5
-    ma5_rising = v5 > float(ma5_prev)
+    # 75MA上向き: 4週間前(約20営業日)と比較
+    ma75_prev = ma75.iloc[-21] if len(ma75) >= 21 and pd.notna(ma75.iloc[-21]) else v75
+    ma75_rising = v75 > float(ma75_prev)
 
-    # MA25も上向きか（中期トレンドが健在か）
-    ma25_prev = ma25.iloc[-6] if len(ma25) >= 6 and pd.notna(ma25.iloc[-6]) else v25
-    ma25_rising = v25 > float(ma25_prev)
+    # 52週高値・安値（データが足りない場合は利用可能な分で計算）
+    window = min(252, len(close))
+    high52 = float(close.rolling(window).max().iloc[-1])
+    low52  = float(close.rolling(window).min().iloc[-1])
+    pct_from_high = v_close / high52 if high52 > 0 else 0
+    pct_from_low  = v_close / low52  if low52 > 0 else 0
 
-    if v5 > v25 > v75:
-        if ma5_rising and ma25_rising:
-            return 15.0, f"完全上昇トレンド (5>{v5:.0f} 25>{v25:.0f} 75>{v75:.0f}, 両MA上向き)"
-        elif ma5_rising:
-            return 12.0, f"上昇トレンド+加速中 (5MA上向き)"
-        else:
-            return 9.0, f"パーフェクトオーダー (5MA横ばい)"
-    elif v5 > v25:
-        return 5.0 if ma5_rising else 3.0, f"短期上昇 ({'加速' if ma5_rising else '横ばい'})"
-    elif v25 > v75:
-        return 2.0, f"中期上昇のみ"
-    else:
-        return 0.0, f"下降トレンド"
+    # 5条件チェック
+    conds = [
+        v_close > v25 and v25 > v75,   # 1. MAスタック
+        v_close > v5,                   # 2. 短期MAより上
+        ma75_rising,                    # 3. 長期MAが上向き
+        pct_from_high >= 0.75,          # 4. 52週高値の75%以上
+        pct_from_low  >= 1.30,          # 5. 52週安値の130%以上
+    ]
+    n = sum(conds)
+    labels = ["MAスタック", "5MA上", "75MA上向", "高値圏", "安値比+30%"]
+    met = [labels[i] for i, c in enumerate(conds) if c]
+
+    scores_map = {5: 15.0, 4: 11.0, 3: 6.0, 2: 2.0}
+    score = scores_map.get(n, 0.0)
+    note  = f"Stage2条件{n}/5 [{', '.join(met)}]" if met else f"条件未達({n}/5)"
+    return score, note
 
 
 def score_momentum(close: pd.Series) -> tuple[float, str]:
-    """モメンタム健全性スコア（15点）
+    """12-1ヶ月モメンタム因子 + MACD（15点）
 
-    RSI(14)が50-68の「健全ゾーン」にある銘柄を高評価。
-    過熱（RSI>70）は翌日反落リスクが高いため減点。
-    MACDでトレンド継続の確認を行う。
+    Jegadeesh & Titman (1993) の学術的に実証されたモメンタム因子。
+    「直近12ヶ月のリターンから直近1ヶ月を除いたもの」を使う。
+    直近1ヶ月を除く理由: 短期的な平均回帰（反転）ノイズを取り除くため。
+
+    例: 今日が基準なら「約11ヶ月前〜約1ヶ月前」の価格変動を評価。
+    この期間に大きく上昇した銘柄は翌月も上昇しやすいことが統計的に示されている。
+
+    スコア（8点）:
+      +15%以上: 8点 / +8%以上: 6点 / +3%以上: 4点 / +0%以上: 2点 / マイナス: 0点
+
+    MACD（7点）: エントリータイミングの最終確認
     """
     if len(close) < 30:
         return 0.0, "データ不足"
 
-    rsi   = _calc_rsi(close, period=14)
-    macd, signal = _calc_macd(close)
-
-    rsi_val    = _safe_last(rsi)
-    macd_val   = _safe_last(macd)
-    signal_val = _safe_last(signal)
-    prev_macd   = macd.iloc[-2] if len(macd) >= 2 else macd_val
-    prev_signal = signal.iloc[-2] if len(signal) >= 2 else signal_val
-
     score = 0.0
     notes = []
 
-    # RSI(14)スコア（8点）
-    # 50-68: 上昇継続中かつ過熱していない「最良ゾーン」
-    # >70:   短期過熱 → 反落しやすい → 低評価
-    # <50:   上昇力不足 → 低評価
-    if 55 <= rsi_val <= 68:
-        score += 8.0
-        notes.append(f"RSI健全ゾーン({rsi_val:.1f})")
-    elif 50 <= rsi_val < 55:
-        score += 5.0
-        notes.append(f"RSI上昇圏({rsi_val:.1f})")
-    elif 68 < rsi_val <= 75:
-        score += 3.0
-        notes.append(f"RSIやや過熱({rsi_val:.1f})")
-    elif 45 <= rsi_val < 50:
-        score += 2.0
-        notes.append(f"RSI中立({rsi_val:.1f})")
-    else:
-        notes.append(f"RSI{'過熱' if rsi_val > 75 else '弱気'}({rsi_val:.1f})")
+    # ── 12-1ヶ月モメンタム（8点） ──
+    # 約252営業日前〜約22営業日前のリターン
+    end_idx   = -22   # 1ヶ月前（直近を除く）
+    start_idx = -252  # 12ヶ月前
 
-    # MACDゴールデンクロス（7点）
+    if len(close) >= 252:
+        price_start = float(close.iloc[start_idx])
+        price_end   = float(close.iloc[end_idx])
+    elif len(close) >= 66:
+        # データ不足の場合は3ヶ月前〜1ヶ月前で代用（短期版）
+        price_start = float(close.iloc[-66])
+        price_end   = float(close.iloc[end_idx])
+    else:
+        price_start = price_end = float(close.iloc[0])
+
+    momentum_pct = (price_end / price_start - 1) * 100 if price_start > 0 else 0.0
+    period_label = "12-1月" if len(close) >= 252 else "3-1月"
+
+    if momentum_pct >= 15.0:
+        score += 8.0
+        notes.append(f"モメンタム強({period_label}:{momentum_pct:+.1f}%)")
+    elif momentum_pct >= 8.0:
+        score += 6.0
+        notes.append(f"モメンタム中({period_label}:{momentum_pct:+.1f}%)")
+    elif momentum_pct >= 3.0:
+        score += 4.0
+        notes.append(f"モメンタム弱({period_label}:{momentum_pct:+.1f}%)")
+    elif momentum_pct >= 0.0:
+        score += 2.0
+        notes.append(f"モメンタム微({period_label}:{momentum_pct:+.1f}%)")
+    else:
+        notes.append(f"モメンタム負({period_label}:{momentum_pct:+.1f}%)")
+
+    # ── MACD（7点）: 短期エントリータイミング確認 ──
+    macd, signal = _calc_macd(close)
+    macd_val    = _safe_last(macd)
+    signal_val  = _safe_last(signal)
+    prev_macd   = macd.iloc[-2] if len(macd) >= 2 else macd_val
+    prev_signal = signal.iloc[-2] if len(signal) >= 2 else signal_val
+
     golden_cross = (prev_macd < prev_signal) and (macd_val > signal_val)
     macd_above   = macd_val > signal_val
 
