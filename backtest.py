@@ -33,8 +33,12 @@ INITIAL_CAPITAL = 1_000_000   # 初期資金 ¥100万
 COMMISSION_RATE = 0.0005       # 片道0.05%手数料（SBI/楽天等のネット証券現実値）
 
 # 日次戦略用 ストップロス/テイクプロフィット
-TAKE_PROFIT_PCT = 0.03   # +3% でテイクプロフィット
-STOP_LOSS_PCT   = 0.02   # -2% でストップロス
+TAKE_PROFIT_PCT  = 0.03   # +3% でテイクプロフィット
+STOP_LOSS_PCT    = 0.02   # -2% でストップロス
+
+# スマートリバランス制御
+MIN_HOLD_DAYS    = 5      # 最低保有営業日数（SL/TP除く）
+SCORE_REPLACE_THRESHOLD = 5.0  # 現保有より何点高ければ交代するか
 
 logging.basicConfig(
     level=logging.INFO,
@@ -232,14 +236,45 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int,
             capital = pv
             continue
 
-        top_set = set(sorted(scores, key=lambda x: scores[x], reverse=True)[:top_n])
+        top_ranked = sorted(scores, key=lambda x: scores[x], reverse=True)
+        top_set    = set(top_ranked[:top_n])
         current_set = set(holdings.keys())
 
-        to_sell = current_set - top_set   # 今日外れた銘柄 → 売却
-        to_buy  = top_set - current_set   # 今日新たに入った銘柄 → 購入
-        to_keep = current_set & top_set   # 継続保有（SL/TPチェックのみ）
+        # ── 最低保有日数・スコア閾値によるホールドフィルタ ──
+        # 保有銘柄がtop_nから外れても、以下の場合は売らずに保持する:
+        #   1. まだ MIN_HOLD_DAYS 営業日経過していない
+        #   2. 交代候補が現保有より SCORE_REPLACE_THRESHOLD 点以上高くない
+        protected = set()
+        for ticker in current_set:
+            if ticker in top_set:
+                continue  # 引き続きtop_nなら問題なし
+            _, _, entry_date = holdings[ticker]
+            hold_days = sum(1 for d in rebalance_dates if entry_date <= d <= date)
 
-        # ── SL/TPチェック（継続保有銘柄も含む） ──
+            if hold_days < MIN_HOLD_DAYS:
+                # 最低保有期間未達 → 守る
+                protected.add(ticker)
+                continue
+
+            # スコア差チェック: top_nの最下位と比較
+            current_score   = scores.get(ticker, 0)
+            weakest_in_top  = scores.get(top_ranked[top_n - 1], 0) if len(top_ranked) >= top_n else 0
+            if weakest_in_top - current_score < SCORE_REPLACE_THRESHOLD:
+                # 点差が閾値未満 → 守る（ノイズによる交代を防ぐ）
+                protected.add(ticker)
+
+        # protectedを反映してtop_setを拡張（最大top_n + protected数まで許可）
+        for ticker in protected:
+            top_set.add(ticker)
+        # top_setが大きすぎる場合はスコア下位を削る
+        if len(top_set) > top_n:
+            top_set = set(sorted(top_set, key=lambda x: scores.get(x, 0), reverse=True)[:top_n])
+
+        to_sell = current_set - top_set
+        to_buy  = top_set - current_set
+        to_keep = current_set & top_set
+
+        # ── SL/TPチェック（保有銘柄全員） ──
         if use_sl_tp:
             for ticker in list(to_keep):
                 entry_price, shares, entry_date = holdings[ticker]
@@ -247,7 +282,6 @@ def run_backtest(all_data: dict, rebalance_dates: list, top_n: int,
                 if df is None:
                     continue
                 exit_price, exit_reason = _simulate_exit(df, entry_date, entry_price, True)
-                # SLかTPが発動した場合は売却扱いにする
                 if exit_reason != "引け決済":
                     to_sell.add(ticker)
                     to_keep.discard(ticker)
