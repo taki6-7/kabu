@@ -33,12 +33,12 @@ INITIAL_CAPITAL = 1_000_000   # 初期資金 ¥100万
 COMMISSION_RATE = 0.0005       # 片道0.05%手数料（SBI/楽天等のネット証券現実値）
 
 # 日次戦略用 ストップロス/テイクプロフィット
-TAKE_PROFIT_PCT  = 0.03   # +3% でテイクプロフィット
-STOP_LOSS_PCT    = 0.02   # -2% でストップロス
+TAKE_PROFIT_PCT  = 0.10   # +10% でテイクプロフィット（週次では勝ちを伸ばす）
+STOP_LOSS_PCT    = 0.05   # -5%  でストップロス（週次の通常値動きを許容）
 
 # スマートリバランス制御
-MIN_HOLD_DAYS    = 5      # 最低保有営業日数（SL/TP除く）
-SCORE_REPLACE_THRESHOLD = 5.0  # 現保有より何点高ければ交代するか
+MIN_HOLD_DAYS    = 10     # 最低保有営業日数 = 約2週間（SL/TP除く）
+SCORE_REPLACE_THRESHOLD = 8.0  # 現保有より何点高ければ交代するか
 
 logging.basicConfig(
     level=logging.INFO,
@@ -674,7 +674,7 @@ def main():
     parser = argparse.ArgumentParser(description="kabu バックテストエンジン")
     parser.add_argument("--years",     type=float, default=2.0,        help="バックテスト期間（年）")
     parser.add_argument("--top-n",     type=int,   default=5,          help="保有銘柄数")
-    parser.add_argument("--rebalance", type=str,   default="daily",
+    parser.add_argument("--rebalance", type=str,   default="weekly",
                         choices=["daily", "weekly", "biweekly", "monthly"], help="リバランス頻度")
     parser.add_argument("--sl-tp",     action="store_true",             help="ストップロス/テイクプロフィットを有効化")
     args = parser.parse_args()
