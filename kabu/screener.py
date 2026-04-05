@@ -5,13 +5,24 @@
 
 import logging
 import time
+import datetime
+from pathlib import Path
+import io
+
 import pandas as pd
+import requests
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-# 東証プライム主要銘柄（時価総額上位500銘柄程度を代表するリスト）
-# 実運用ではJPXのCSVを取得して使うことを推奨
+# JPX公式CSVのURL（東証上場銘柄一覧 data_j.xls）
+JPX_XLS_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+
+# キャッシュファイルパス
+_DATA_DIR = Path(__file__).parent / "data"
+_CACHE_FILE = _DATA_DIR / "tickers_prime.csv"
+
+# フォールバック用サンプル（JPX取得失敗時）
 PRIME_TICKERS_SAMPLE = [
     # 大型株
     "7203.T", "6758.T", "6861.T", "8306.T", "9432.T",
@@ -38,8 +49,115 @@ PRIME_TICKERS_SAMPLE = [
 ]
 
 
+def _is_cache_fresh() -> bool:
+    """キャッシュが今日のものかチェック"""
+    if not _CACHE_FILE.exists():
+        return False
+    mtime = datetime.date.fromtimestamp(_CACHE_FILE.stat().st_mtime)
+    return mtime >= datetime.date.today()
+
+
+def fetch_prime_tickers_from_jpx() -> list[str]:
+    """
+    JPX公式Excelから東証プライム銘柄コードを取得する。
+    当日キャッシュがあればそれを使用し、なければJPXからダウンロードする。
+
+    Returns:
+        プライム市場銘柄のyfinanceティッカーリスト（例: ["7203.T", ...]）
+    """
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # キャッシュが新鮮なら即返す
+    if _is_cache_fresh():
+        try:
+            df = pd.read_csv(_CACHE_FILE, dtype=str)
+            tickers = df["ticker"].tolist()
+            logger.info(f"JPXキャッシュから{len(tickers)}銘柄をロード")
+            return tickers
+        except Exception as e:
+            logger.warning(f"キャッシュ読み込み失敗、再ダウンロードします: {e}")
+
+    # JPXからExcelをダウンロード
+    logger.info("JPX公式サイトから銘柄一覧をダウンロード中...")
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(JPX_XLS_URL, headers=headers, timeout=30)
+        resp.raise_for_status()
+
+        # Excelを読み込む（xlrd が .xls を処理）
+        df_raw = pd.read_excel(io.BytesIO(resp.content), dtype=str)
+
+        # 列名を確認してプライム市場行を抽出
+        # JPXファイルの列: 日付, コード, 銘柄名, 市場・商品区分, 33業種区分, 17業種区分, 規模区分
+        logger.debug(f"JPX Excel列名: {df_raw.columns.tolist()}")
+
+        # 市場区分列・コード列を特定
+        market_col = None
+        code_col = None
+        for col in df_raw.columns:
+            col_str = str(col).strip()
+            if ("市場" in col_str and "商品" in col_str) or col_str == "市場区分":
+                market_col = col
+            elif "市場" in col_str and market_col is None:
+                market_col = col
+            if "コード" in col_str:
+                code_col = col
+
+        if market_col is None or code_col is None:
+            # 列位置で推定（JPXフォーマット: 0=日付, 1=コード, 2=銘柄名, 3=市場区分）
+            logger.warning(
+                f"列名で市場・コード列を特定できませんでした。"
+                f"列一覧: {df_raw.columns.tolist()} → 位置で推定します。"
+            )
+            cols = df_raw.columns.tolist()
+            code_col = cols[1] if len(cols) > 1 else cols[0]
+            market_col = cols[3] if len(cols) > 3 else cols[2]
+
+        logger.info(f"使用列: コード='{code_col}', 市場区分='{market_col}'")
+
+        # プライム市場でフィルタ
+        prime_mask = df_raw[market_col].str.contains("プライム", na=False)
+        df_prime = df_raw[prime_mask].copy()
+
+        logger.info(f"プライム市場銘柄数: {len(df_prime)}")
+
+        if len(df_prime) == 0:
+            raise ValueError("プライム市場銘柄が1件も抽出できませんでした")
+
+        # コードを4桁ゼロ埋め → yfinanceティッカー形式に変換
+        codes = df_prime[code_col].str.strip().str.zfill(4)
+        # 数字4桁のみ（ETF等の英字コードを除外）
+        codes = codes[codes.str.match(r"^\d{4}$")]
+        tickers = (codes + ".T").tolist()
+
+        # キャッシュに保存
+        pd.DataFrame({"ticker": tickers}).to_csv(_CACHE_FILE, index=False)
+        logger.info(f"JPXから{len(tickers)}銘柄を取得しキャッシュに保存しました")
+        return tickers
+
+    except Exception as e:
+        logger.error(f"JPXダウンロード失敗: {e}")
+        return []
+
+
 def get_prime_tickers() -> list[str]:
-    """東証プライム銘柄リストを返す（将来JPX CSVに差し替え可能）"""
+    """
+    東証プライム銘柄リストを返す。
+    JPX公式CSVから取得し、失敗時はサンプルリストにフォールバック。
+    """
+    tickers = fetch_prime_tickers_from_jpx()
+    if tickers:
+        return tickers
+
+    logger.warning(
+        f"JPX取得失敗。フォールバック: サンプル{len(PRIME_TICKERS_SAMPLE)}銘柄を使用"
+    )
     return PRIME_TICKERS_SAMPLE
 
 

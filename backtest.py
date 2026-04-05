@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from kabu.screener import PRIME_TICKERS_SAMPLE
+from kabu.screener import PRIME_TICKERS_SAMPLE, get_prime_tickers
 from kabu.technical import score_trend, score_momentum, score_volume, score_price_action
 
 # ─────────────────────────────────────────────
@@ -677,6 +677,7 @@ def main():
     parser.add_argument("--rebalance", type=str,   default="weekly",
                         choices=["daily", "weekly", "biweekly", "monthly"], help="リバランス頻度")
     parser.add_argument("--sl-tp",     action="store_true",             help="ストップロス/テイクプロフィットを有効化")
+    parser.add_argument("--sample",    action="store_true",             help="サンプル100銘柄で高速テスト（JPX全銘柄を使わない）")
     args = parser.parse_args()
 
     end_date   = datetime.today()
@@ -687,7 +688,13 @@ def main():
     end_str   = end_date.strftime("%Y-%m-%d")
 
     # ── 1. データダウンロード ──
-    all_data = download_all_data(PRIME_TICKERS_SAMPLE, start=start_str, end=end_str)
+    if args.sample:
+        ticker_universe = PRIME_TICKERS_SAMPLE
+        logger.info(f"サンプルモード: {len(ticker_universe)}銘柄を使用")
+    else:
+        ticker_universe = get_prime_tickers()
+        logger.info(f"JPX全銘柄モード: {len(ticker_universe)}銘柄を使用（時間がかかります）")
+    all_data = download_all_data(ticker_universe, start=start_str, end=end_str)
 
     logger.info(f"ベンチマーク ({BENCHMARK_TICKER}) ダウンロード中...")
     benchmark_data = yf.download(BENCHMARK_TICKER, start=start_str, end=end_str,
