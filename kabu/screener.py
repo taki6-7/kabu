@@ -80,15 +80,33 @@ def fetch_prime_tickers_from_jpx() -> list[str]:
     # JPXからExcelをダウンロード
     logger.info("JPX公式サイトから銘柄一覧をダウンロード中...")
     try:
+        session = requests.Session()
+        # まず親ページにアクセスしてCookieを取得
+        page_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
         }
-        resp = requests.get(JPX_XLS_URL, headers=headers, timeout=30)
+        try:
+            session.get(page_url, headers=headers, timeout=15)
+        except Exception:
+            pass  # Cookie取得失敗は無視してダウンロード続行
+
+        dl_headers = {
+            **headers,
+            "Referer": page_url,
+        }
+        resp = session.get(JPX_XLS_URL, headers=dl_headers, timeout=60)
         resp.raise_for_status()
+
+        if len(resp.content) < 1000:
+            raise ValueError(f"ダウンロードコンテンツが小さすぎます ({len(resp.content)} bytes)")
 
         # Excelを読み込む（xlrd が .xls を処理）
         df_raw = pd.read_excel(io.BytesIO(resp.content), dtype=str)
@@ -143,6 +161,15 @@ def fetch_prime_tickers_from_jpx() -> list[str]:
 
     except Exception as e:
         logger.error(f"JPXダウンロード失敗: {e}")
+        # 古いキャッシュがあれば期限切れでも使用する
+        if _CACHE_FILE.exists():
+            try:
+                df = pd.read_csv(_CACHE_FILE, dtype=str)
+                tickers = df["ticker"].tolist()
+                logger.warning(f"古いキャッシュを使用: {len(tickers)}銘柄")
+                return tickers
+            except Exception:
+                pass
         return []
 
 
