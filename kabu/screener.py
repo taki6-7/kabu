@@ -57,17 +57,81 @@ def _is_cache_fresh() -> bool:
     return mtime >= datetime.date.today()
 
 
+def _parse_jpx_excel(content: bytes) -> list[str]:
+    """JPX Excelバイト列を解析してプライム銘柄ティッカーリストを返す"""
+    df_raw = pd.read_excel(io.BytesIO(content), dtype=str)
+    logger.debug(f"JPX Excel列名: {df_raw.columns.tolist()}")
+
+    market_col = None
+    code_col = None
+    for col in df_raw.columns:
+        col_str = str(col).strip()
+        if ("市場" in col_str and "商品" in col_str) or col_str == "市場区分":
+            market_col = col
+        elif "市場" in col_str and market_col is None:
+            market_col = col
+        if "コード" in col_str:
+            code_col = col
+
+    if market_col is None or code_col is None:
+        cols = df_raw.columns.tolist()
+        code_col = cols[1] if len(cols) > 1 else cols[0]
+        market_col = cols[3] if len(cols) > 3 else cols[2]
+        logger.warning(f"列を位置で推定: コード='{code_col}', 市場区分='{market_col}'")
+
+    logger.info(f"使用列: コード='{code_col}', 市場区分='{market_col}'")
+
+    prime_mask = df_raw[market_col].str.contains("プライム", na=False)
+    df_prime = df_raw[prime_mask].copy()
+    logger.info(f"プライム市場銘柄数: {len(df_prime)}")
+
+    if len(df_prime) == 0:
+        raise ValueError(
+            f"プライム市場銘柄が抽出できませんでした。"
+            f"市場区分の値: {df_raw[market_col].dropna().unique()[:5].tolist()}"
+        )
+
+    codes = df_prime[code_col].str.strip().str.zfill(4)
+    codes = codes[codes.str.match(r"^\d{4}$")]
+    return (codes + ".T").tolist()
+
+
+def _find_local_jpx_file() -> Path | None:
+    """data_j.xls をよくある場所から自動検索する"""
+    home = Path.home()
+    search_dirs = [
+        Path.cwd(),                          # カレントディレクトリ
+        Path(__file__).parent.parent,        # プロジェクトルート
+        home / "Downloads",                  # ダウンロード
+        home / "Desktop",                    # デスクトップ
+        home / "Documents",                  # ドキュメント
+        home / "OneDrive" / "Downloads",     # OneDrive Downloads
+        home / "OneDrive" / "デスクトップ",
+        home / "デスクトップ",
+        home / "ダウンロード",
+        home / "ドキュメント",
+    ]
+    for d in search_dirs:
+        for name in ("data_j.xls", "data_j.xlsx", "data_j (1).xls"):
+            candidate = d / name
+            if candidate.exists():
+                logger.info(f"data_j.xls を発見: {candidate}")
+                return candidate
+    return None
+
+
 def fetch_prime_tickers_from_jpx() -> list[str]:
     """
     JPX公式Excelから東証プライム銘柄コードを取得する。
-    当日キャッシュがあればそれを使用し、なければJPXからダウンロードする。
-
-    Returns:
-        プライム市場銘柄のyfinanceティッカーリスト（例: ["7203.T", ...]）
+    優先順位:
+      1. 当日キャッシュ
+      2. JPX自動ダウンロード
+      3. ローカルのdata_j.xlsを自動検索
+      4. 古いキャッシュ（期限切れでも使用）
     """
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # キャッシュが新鮮なら即返す
+    # 1. 当日キャッシュ
     if _is_cache_fresh():
         try:
             df = pd.read_csv(_CACHE_FILE, dtype=str)
@@ -75,13 +139,12 @@ def fetch_prime_tickers_from_jpx() -> list[str]:
             logger.info(f"JPXキャッシュから{len(tickers)}銘柄をロード")
             return tickers
         except Exception as e:
-            logger.warning(f"キャッシュ読み込み失敗、再ダウンロードします: {e}")
+            logger.warning(f"キャッシュ読み込み失敗: {e}")
 
-    # JPXからExcelをダウンロード
+    # 2. JPX自動ダウンロード
     logger.info("JPX公式サイトから銘柄一覧をダウンロード中...")
     try:
         session = requests.Session()
-        # まず親ページにアクセスしてCookieを取得
         page_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
         headers = {
             "User-Agent": (
@@ -96,81 +159,49 @@ def fetch_prime_tickers_from_jpx() -> list[str]:
         try:
             session.get(page_url, headers=headers, timeout=15)
         except Exception:
-            pass  # Cookie取得失敗は無視してダウンロード続行
+            pass
 
-        dl_headers = {
-            **headers,
-            "Referer": page_url,
-        }
-        resp = session.get(JPX_XLS_URL, headers=dl_headers, timeout=60)
+        resp = session.get(JPX_XLS_URL, headers={**headers, "Referer": page_url}, timeout=60)
         resp.raise_for_status()
-
         if len(resp.content) < 1000:
-            raise ValueError(f"ダウンロードコンテンツが小さすぎます ({len(resp.content)} bytes)")
+            raise ValueError(f"コンテンツが小さすぎます ({len(resp.content)} bytes)")
 
-        # Excelを読み込む（xlrd が .xls を処理）
-        df_raw = pd.read_excel(io.BytesIO(resp.content), dtype=str)
-
-        # 列名を確認してプライム市場行を抽出
-        # JPXファイルの列: 日付, コード, 銘柄名, 市場・商品区分, 33業種区分, 17業種区分, 規模区分
-        logger.debug(f"JPX Excel列名: {df_raw.columns.tolist()}")
-
-        # 市場区分列・コード列を特定
-        market_col = None
-        code_col = None
-        for col in df_raw.columns:
-            col_str = str(col).strip()
-            if ("市場" in col_str and "商品" in col_str) or col_str == "市場区分":
-                market_col = col
-            elif "市場" in col_str and market_col is None:
-                market_col = col
-            if "コード" in col_str:
-                code_col = col
-
-        if market_col is None or code_col is None:
-            # 列位置で推定（JPXフォーマット: 0=日付, 1=コード, 2=銘柄名, 3=市場区分）
-            logger.warning(
-                f"列名で市場・コード列を特定できませんでした。"
-                f"列一覧: {df_raw.columns.tolist()} → 位置で推定します。"
-            )
-            cols = df_raw.columns.tolist()
-            code_col = cols[1] if len(cols) > 1 else cols[0]
-            market_col = cols[3] if len(cols) > 3 else cols[2]
-
-        logger.info(f"使用列: コード='{code_col}', 市場区分='{market_col}'")
-
-        # プライム市場でフィルタ
-        prime_mask = df_raw[market_col].str.contains("プライム", na=False)
-        df_prime = df_raw[prime_mask].copy()
-
-        logger.info(f"プライム市場銘柄数: {len(df_prime)}")
-
-        if len(df_prime) == 0:
-            raise ValueError("プライム市場銘柄が1件も抽出できませんでした")
-
-        # コードを4桁ゼロ埋め → yfinanceティッカー形式に変換
-        codes = df_prime[code_col].str.strip().str.zfill(4)
-        # 数字4桁のみ（ETF等の英字コードを除外）
-        codes = codes[codes.str.match(r"^\d{4}$")]
-        tickers = (codes + ".T").tolist()
-
-        # キャッシュに保存
+        tickers = _parse_jpx_excel(resp.content)
         pd.DataFrame({"ticker": tickers}).to_csv(_CACHE_FILE, index=False)
-        logger.info(f"JPXから{len(tickers)}銘柄を取得しキャッシュに保存しました")
+        logger.info(f"JPXから{len(tickers)}銘柄を取得・キャッシュ保存")
         return tickers
 
     except Exception as e:
-        logger.error(f"JPXダウンロード失敗: {e}")
-        # 古いキャッシュがあれば期限切れでも使用する
-        if _CACHE_FILE.exists():
-            try:
-                df = pd.read_csv(_CACHE_FILE, dtype=str)
-                tickers = df["ticker"].tolist()
-                logger.warning(f"古いキャッシュを使用: {len(tickers)}銘柄")
-                return tickers
-            except Exception:
-                pass
-        return []
+        logger.warning(f"JPX自動ダウンロード失敗: {e}")
+
+    # 3. ローカルのdata_j.xlsを自動検索
+    local_file = _find_local_jpx_file()
+    if local_file:
+        try:
+            tickers = _parse_jpx_excel(local_file.read_bytes())
+            pd.DataFrame({"ticker": tickers}).to_csv(_CACHE_FILE, index=False)
+            logger.info(f"ローカルファイルから{len(tickers)}銘柄を取得・キャッシュ保存: {local_file}")
+            return tickers
+        except Exception as e:
+            logger.warning(f"ローカルファイル読み込み失敗: {e}")
+
+    # 4. 古いキャッシュ（期限切れでも使用）
+    if _CACHE_FILE.exists():
+        try:
+            df = pd.read_csv(_CACHE_FILE, dtype=str)
+            tickers = df["ticker"].tolist()
+            logger.warning(f"古いキャッシュを使用: {len(tickers)}銘柄")
+            return tickers
+        except Exception:
+            pass
+
+    logger.error(
+        "JPX銘柄リスト取得失敗。対処法:\n"
+        "  ブラウザで https://www.jpx.co.jp/markets/statistics-equities/misc/01.html を開き\n"
+        "  「東証上場銘柄一覧」のdata_j.xlsをダウンロードフォルダに保存してください。\n"
+        "  次回実行時に自動検出されます。"
+    )
+    return []
 
 
 def get_prime_tickers() -> list[str]:
